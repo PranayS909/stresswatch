@@ -63,7 +63,13 @@ export default function MonitorPage() {
           <VitalsSection reading={sensor} />
           <EnvironmentCard reading={env} />
 
-          {score > 60 && <InterventionsPanel score={score} />}
+          {score > 60 && (
+            <InterventionsPanel
+              scoreId={data?.id}
+              score={score}
+              level={level}
+            />
+          )}
 
           <SelfReportPanel userId={user.id} />
           <JournalPanel userId={user.id} />

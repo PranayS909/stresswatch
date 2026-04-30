@@ -13,13 +13,13 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime, timezone, timedelta
-from typing import Optional
-import asyncio
+from typing import Any, Optional
 
 from config import WEATHER_LOCATION
 from db import db
 from scorer import compute_score
 from weather import fetch_env
+from ai_intervention import generate_intervention_analysis
 
 app = FastAPI(title="StressWatch API", version="1.0.0")
 
@@ -35,6 +35,7 @@ app.add_middleware(
 _env_cache: dict = {}
 _env_cache_ts: datetime = datetime.min.replace(tzinfo=timezone.utc)
 ENV_TTL_SECONDS = 3600
+_analysis_cache: dict[str, dict[str, Any]] = {}
 
 
 async def get_env_cached(user_id: str) -> tuple[dict | None, str | None]:
@@ -91,6 +92,60 @@ class RescoreRequest(BaseModel):
 class ValidateRequest(BaseModel):
     score_id: str
     validated_score: float
+
+
+def _fetch_single(table: str, row_id: Optional[str], columns: str = "*") -> dict | None:
+    if not row_id:
+        return None
+    res = db.table(table).select(columns).eq("id", row_id).limit(1).execute()
+    if res.data:
+        return res.data[0]
+    return None
+
+
+def build_analysis_context(score_id: str) -> dict[str, Any]:
+    score_row = _fetch_single("stress_scores", score_id)
+    if not score_row:
+        raise HTTPException(404, "Stress score not found")
+
+    sensor = _fetch_single(
+        "sensor_readings",
+        score_row.get("sensor_reading_id"),
+        "bpm, spo2, hrv_rmssd, recorded_at",
+    )
+    env = _fetch_single(
+        "env_readings",
+        score_row.get("env_reading_id"),
+        "temperature, aqi_us_epa, co, no2, o3, pm2_5, pm10, recorded_at",
+    )
+    report = _fetch_single(
+        "self_reports",
+        score_row.get("self_report_id"),
+        "mood_score, triggers, notes, reported_at",
+    )
+
+    return {
+        "score_id": score_row["id"],
+        "user_id": score_row.get("user_id"),
+        "score": score_row.get("score"),
+        "level": score_row.get("level"),
+        "dominant_factor": score_row.get("dominant_factor"),
+        "scored_at": score_row.get("scored_at"),
+        "sensor": sensor,
+        "environment": env,
+        "self_report": report,
+    }
+
+
+async def prewarm_intervention_analysis(score_id: str):
+    try:
+        context = build_analysis_context(score_id)
+        if context.get("level") not in {"high", "critical"}:
+            return
+        result = await generate_intervention_analysis(context)
+        _analysis_cache[score_id] = result
+    except Exception as exc:
+        print(f"[analysis] Failed to prewarm {score_id}: {exc}")
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
@@ -151,13 +206,16 @@ async def ingest(payload: SensorPayload, bg: BackgroundTasks):
         "env_reading_id":    env_id,
         "self_report_id":    report.get("report_id"),
     }
-    db.table("stress_scores").insert(score_row).execute()
+    score_res = db.table("stress_scores").insert(score_row).execute()
+    score_id = score_res.data[0]["id"] if score_res.data else None
+    if score_id and result["level"] in {"high", "critical"}:
+        bg.add_task(prewarm_intervention_analysis, score_id)
 
     return result
 
 
 @app.post("/rescore")
-async def rescore(req: RescoreRequest):
+async def rescore(req: RescoreRequest, bg: BackgroundTasks):
     """
     Re-runs scoring using the latest sensor reading + new mood data.
     Called after a user submits a mood check-in from the frontend.
@@ -191,7 +249,7 @@ async def rescore(req: RescoreRequest):
         trigger_count=report["trigger_count"],
     )
 
-    db.table("stress_scores").insert({
+    score_res = db.table("stress_scores").insert({
         "user_id":          uid,
         "score":            result["score"],
         "level":            result["level"],
@@ -200,6 +258,9 @@ async def rescore(req: RescoreRequest):
         "env_reading_id":    env_id,
         "self_report_id":    report.get("report_id"),
     }).execute()
+    score_id = score_res.data[0]["id"] if score_res.data else None
+    if score_id and result["level"] in {"high", "critical"}:
+        bg.add_task(prewarm_intervention_analysis, score_id)
 
     return result
 
@@ -226,3 +287,29 @@ async def validate(req: ValidateRequest):
         "validated_score": req.validated_score
     }).eq("id", req.score_id).execute()
     return {"status": "saved"}
+
+
+@app.get("/analysis/{score_id}")
+async def intervention_analysis(score_id: str):
+    if score_id in _analysis_cache:
+        return {
+            "score_id": score_id,
+            "available": True,
+            **_analysis_cache[score_id],
+        }
+
+    context = build_analysis_context(score_id)
+    if context.get("level") not in {"high", "critical"}:
+        return {
+            "score_id": score_id,
+            "available": False,
+            "reason": f"No AI intervention needed for {context.get('level', 'unknown')} stress",
+        }
+
+    result = await generate_intervention_analysis(context)
+    _analysis_cache[score_id] = result
+    return {
+        "score_id": score_id,
+        "available": True,
+        **result,
+    }
